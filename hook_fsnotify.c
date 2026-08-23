@@ -12,9 +12,10 @@
 #include <linux/kernel.h>
 #include <linux/printk.h>
 #include <linux/string.h>
+#include <asm-generic/rwonce.h>
 
 KPM_NAME("hook_fsnotify");
-KPM_VERSION("1.1.0");
+KPM_VERSION("1.2.0");
 KPM_LICENSE("MIT");
 KPM_AUTHOR("Yervant7");
 KPM_DESCRIPTION("A KernelPatch Module (KPM) for Hooking fsnotify, for Linux 5.10 to 6.12");
@@ -22,21 +23,10 @@ KPM_DESCRIPTION("A KernelPatch Module (KPM) for Hooking fsnotify, for Linux 5.10
 #define YV_TAG "[hook-fsnotify] "
 
 #define yv_info(fmt, ...) logki(YV_TAG fmt, ##__VA_ARGS__)
-#define yv_debug(fmt, ...) logkd(YV_TAG fmt, ##__VA_ARGS__)
 #define yv_error(fmt, ...) logke(YV_TAG fmt, ##__VA_ARGS__)
 
-static bool init_error = false;
 static bool hook_active = false;
 static unsigned long fsnotify_addr = 0;
-
-#define hkfunc_match(func)                                                     \
-kfunc_lookup_name(func);                                                     \
-if (!kf_##func) {                                                            \
-    yv_error("Failed to find kfunc %s\n", #func);                              \
-    init_error = true;                                                         \
-};
-
-long kfunc_def(copy_from_kernel_nofault)(void *dst, const void *src, size_t size);
 
 struct inode;
 
@@ -77,39 +67,54 @@ static void send_user_msg(char __user *out_msg, int outlen, const char *msg) {
     compat_copy_to_user(out_msg, msg, len + 1);
 }
 
+struct inode_min {
+    char pad[SUPER_BLOCK_OFF];
+    void *i_sb;
+};
+
+struct super_block_min {
+    char pad[MAGIC_OFF];
+    unsigned long s_magic;
+};
+
+static inline bool is_proc_inode(const struct inode *inode)
+{
+    const struct inode_min *i = (const struct inode_min *)inode;
+    const struct super_block_min *sb;
+
+    if (!i)
+        return false;
+
+    sb = (const struct super_block_min *)READ_ONCE(i->i_sb);
+    if (!sb)
+        return false;
+
+    return (READ_ONCE(sb->s_magic) == PROC_SUPER_MAGIC);
+}
+
 /*
 int fsnotify(__u32 mask, const void *data, int data_type, struct inode *dir, const struct qstr *file_name, struct inode *inode, u32 cookie)
 */
 
-static void before_fsnotify(hook_fargs7_t *args, void *udata) {
-    if (!hook_active) return;
-    if (!args) return;
-    
-    struct inode *dir = (struct inode *)args->arg3;
-    struct inode *inode = (struct inode *)args->arg5;
-    struct inode *target = inode ? inode : dir;
-    
-    if (!target) return;
-    if (!kfunc(copy_from_kernel_nofault)) return;
-    
-    unsigned long sb_ptr = 0;
-    
-    if (kfunc(copy_from_kernel_nofault)(&sb_ptr, (char *)target + SUPER_BLOCK_OFF, sizeof(sb_ptr)) != 0) {
-        return; 
-    }
-    
-    if (sb_ptr) {
-        unsigned long magic = 0;
-        
-        if (kfunc(copy_from_kernel_nofault)(&magic, (char *)sb_ptr + MAGIC_OFF, sizeof(magic)) != 0) {
-            return;
-        }
-        
-        if (magic == PROC_SUPER_MAGIC) {
-            yv_debug("fsnotify ignored for /proc\n");
-            args->skip_origin = 1;
-            args->ret = 0;
-        }
+static void before_fsnotify(hook_fargs7_t *args, void *udata)
+{
+    struct inode *dir;
+    struct inode *inode;
+    struct inode *target;
+
+    if (!READ_ONCE(hook_active) || !args)
+        return;
+
+    dir   = (struct inode *)args->arg3;
+    inode = (struct inode *)args->arg5;
+    target = inode ? inode : dir;
+
+    if (!target)
+        return;
+
+    if (is_proc_inode(target)) {
+        args->skip_origin = 1;
+        args->ret = 0;
     }
 }
 
@@ -118,12 +123,6 @@ static long module_init_handler(const char *args, const char *event, void *__use
     if (kver < VERSION(5, 10, 0)) {
         yv_error("Kernel versions prior to 5.10 don't need this, aborting...\n");
         return -1;
-    }
-    
-    hkfunc_match(copy_from_kernel_nofault);
-    if (init_error) {
-        yv_error("Symbol resolution failed, aborting hook\n");
-        return -ENOENT;
     }
     
     fsnotify_addr = kallsyms_lookup_name("fsnotify");
@@ -147,23 +146,23 @@ static long module_control_handler(const char *args, char __user *out_msg, int o
     long ret = 0;
     
     if (kpm_streq(cmd, "enable") || kpm_streq(cmd, "on") || kpm_streq(cmd, "start") || kpm_streq(cmd, "1")) {
-        hook_active = true;
+        WRITE_ONCE(hook_active, true);
         send_user_msg(out_msg, outlen, "hook_fsnotify: enabled\n");
     } else if (kpm_streq(cmd, "disable") || kpm_streq(cmd, "off") || kpm_streq(cmd, "stop") || kpm_streq(cmd, "0")) {
-        hook_active = false;
+        WRITE_ONCE(hook_active, false);
         send_user_msg(out_msg, outlen, "hook_fsnotify: disabled\n");
     } else if (kpm_streq(cmd, "status") || kpm_streq(cmd, "state") || kpm_streq(cmd, "get")) {
-        if (hook_active) {
+        if (READ_ONCE(hook_active)) {
             send_user_msg(out_msg, outlen, "hook_fsnotify: active\n");
         } else {
             send_user_msg(out_msg, outlen, "hook_fsnotify: inactive\n");
         }
     } else if (kpm_streq(cmd, "toggle")) {
-        if (hook_active) {
-            hook_active = false;
+        if (READ_ONCE(hook_active)) {
+            WRITE_ONCE(hook_active, false);
             send_user_msg(out_msg, outlen, "hook_fsnotify: toggled to disabled\n");
         } else {
-            hook_active = true;
+            WRITE_ONCE(hook_active, true);
             send_user_msg(out_msg, outlen, "hook_fsnotify: toggled to enabled\n");
         }
     } else {
