@@ -6,10 +6,14 @@
 
 ---
 
+# ATTENTION: If you are already using HMKPM version 2.5.0 or later, you do not need this.
+
+---
+
 ## 📖 Overview
 
 - **Name**: `hook_fsnotify`
-- **Version**: `1.1.0`
+- **Version**: `1.2.0`
 - **License**: MIT
 - **Author**: Yervant7
 - **Target Architecture**: ARM64 (`aarch64`)
@@ -21,7 +25,6 @@
 
 - Inline‑hook of `fsnotify` to filter out notifications from `/proc`.
 - Runtime control commands: `enable`, `disable`, `status`, `toggle`.
-- Safe pointer handling – every struct traversal checks for `NULL` to avoid kernel panics.
 - Fully compatible with KernelPatch's symbol resolution and hooking APIs.
 
 ---
@@ -43,7 +46,7 @@ The resulting artifact will be placed in `hook_fsnotify.kpm`.
 
 ## 🛠️ Usage
 
-After loading the KPM on the target device, you can control it using the KPM control interface:
+After loading the KPM on the target device, you can control it using the KPM control interface.
 
 ---
 
